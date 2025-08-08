@@ -175,35 +175,56 @@ class ScientificPaperAgent:
         return initial_results[:max_chunks]  # Return up to max_chunks for processing
 
     def _expand_query_terms(self, query: str) -> str:
-        """Expand query with related terms for better document coverage"""
-        query_lower = query.lower()
+        """Expand query with related terms for better document coverage (domain-agnostic + domain-specific)."""
+        q = query.lower()
+        expanded_terms: List[str] = []
         
-        # Extract key terms and add synonyms/related terms
-        expanded_terms = []
-        
-        # Add common scientific synonyms and related terms
-        term_expansions = {
+        # General scientific term expansions
+        general_expansions = {
             'method': ['approach', 'technique', 'procedure', 'methodology'],
             'result': ['finding', 'outcome', 'conclusion', 'data'],
             'analysis': ['study', 'investigation', 'examination', 'evaluation'],
-            'model': ['framework', 'system', 'approach', 'theory'],
-            'effect': ['impact', 'influence', 'consequence', 'result'],
-            'property': ['characteristic', 'feature', 'attribute', 'behavior'],
-            'structure': ['organization', 'arrangement', 'composition', 'architecture'],
-            'process': ['procedure', 'method', 'mechanism', 'pathway']
+            'model': ['framework', 'system', 'theory'],
+            'effect': ['impact', 'influence', 'consequence'],
+            'property': ['characteristic', 'feature', 'behavior'],
+            'structure': ['arrangement', 'composition', 'architecture'],
+            'process': ['mechanism', 'pathway']
         }
         
-        # Add relevant expansions
-        words = query.split()
-        for word in words:
-            word_lower = word.lower().strip('.,?!')
-            if word_lower in term_expansions:
-                # Add one related term to avoid query explosion
-                expanded_terms.append(term_expansions[word_lower][0])
+        # Domain-specific expansions (extensible)
+        domain_expansions = {
+            'solvent extraction': ['liquid-liquid extraction', 'lle', 'sx', 'partitioning', 'distribution ratio', 'extractant'],
+            'separation': ['extraction', 'partitioning', 'selectivity'],
+            'spectroscopy': ['nmr', 'infrared', 'ir', 'raman', 'uv-vis', 'mass spectrometry', 'ms'],
+            'machine learning': ['ml', 'neural network', 'deep learning', 'ai'],
+            'density functional theory': ['dft', 'functional', 'exchange-correlation'],
+            'molecular dynamics': ['md', 'simulation', 'trajectory'],
+            'optimization': ['minimization', 'maximize', 'objective'],
+        }
+        
+        def add_terms_for(needle: str, terms: List[str]):
+            if needle in q:
+                for t in terms:
+                    if t not in expanded_terms:
+                        expanded_terms.append(t)
+        
+        # Add general expansions for words present in the query
+        for word, terms in general_expansions.items():
+            if word in q:
+                add_terms_for(word, terms)
+        
+        # Add domain-specific expansions
+        for phrase, terms in domain_expansions.items():
+            if phrase in q:
+                add_terms_for(phrase, terms)
+        
+        # Special case: detect variants of liquid-liquid extraction
+        if any(s in q for s in ['liquid liquid extraction', 'liquid-liquid extraction', 'lle', 'sx']):
+            add_terms_for('solvent extraction', domain_expansions['solvent extraction'])
         
         # Construct expanded query (keep it reasonable)
         if expanded_terms:
-            return f"{query} {' '.join(expanded_terms[:2])}"  # Add max 2 expansion terms
+            return f"{query} {' '.join(expanded_terms[:6])}"  # Add up to 6 terms for better recall
         
         return query
 
@@ -304,8 +325,11 @@ class ScientificPaperAgent:
         """Classify query type for appropriate template selection"""
         query_lower = query.lower()
         
-        # Author queries - looking for specific researchers
-        if any(pattern in query_lower for pattern in ['author', 'wrote', 'published', 'by', 'papers by', 'work by']):
+        # Author queries - include common phrasings like "papers from X", "papers by X", and typos like "where"
+        if (
+            re.search(r"\b(?:papers?|work|research|studies?)\b.*\b(?:by|from|of)\b", query_lower) or
+            any(pattern in query_lower for pattern in ['author', 'wrote', 'published', 'by', 'from', 'papers by', 'work by'])
+        ):
             return 'author_query'
         
         # Comparison queries - comparing concepts/methods
@@ -320,7 +344,7 @@ class ScientificPaperAgent:
         return 'general_analysis'
 
     def _generate_response(self, query: str, search_results: List[SearchResult], template: str) -> AgentResponse:
-        """Generate intelligent response using LLM"""
+        """Generate intelligent response using LLM with strict source guarding"""
         
         # Determine query complexity for adaptive context preparation
         complexity = self._analyze_query_complexity(query)
@@ -332,13 +356,23 @@ class ScientificPaperAgent:
         # Prepare context from search results
         context = self._prepare_context(search_results, complexity, total_docs)
         
+        # Build a list of titles available in context to constrain the LLM
+        source_titles = self._get_source_titles(search_results)
+        titles_block = "\n".join(f"- {t}" for t in source_titles if t)
+        
         # Add concept matching hints if relevant
         concept_guidance = self._generate_concept_guidance(query, query_concepts, search_results)
         
-        # Create prompt with enhanced guidance
+        # Create prompt with enhanced guidance and title constraint
         enhanced_template = template
         if concept_guidance:
             enhanced_template = f"{template}\n\nCONCEPT MATCHING GUIDANCE:\n{concept_guidance}"
+        
+        enhanced_template = (
+            f"{enhanced_template}\n\nSOURCE TITLES (you must only cite titles from this list):\n"
+            f"{titles_block if titles_block else '- (no titles)'}\n"
+            f"RULE: Do not invent titles or authors. Only cite from SOURCE TITLES and SOURCE blocks."
+        )
         
         prompt = enhanced_template.format(
             query=query,
@@ -346,9 +380,9 @@ class ScientificPaperAgent:
             num_sources=len(search_results)
         )
         
+        # If no LLM, return extractive fallback
         if self.llm is None:
-            # Fallback response
-            return self._generate_fallback_response(query, search_results)
+            return self._build_extractive_answer(query, search_results)
         
         try:
             # Generate response using LLM
@@ -357,9 +391,15 @@ class ScientificPaperAgent:
             
             # Parse response and extract confidence
             parsed_response = self._parse_llm_response(content)
+            answer_text = parsed_response['answer']
+            
+            # Simple hallucination check: ensure at least one provided title appears
+            if source_titles and not any((t and t in answer_text) for t in source_titles):
+                self.logger.info("LLM answer did not reference provided titles; using extractive fallback.")
+                return self._build_extractive_answer(query, search_results)
             
             return AgentResponse(
-                answer=parsed_response['answer'],
+                answer=answer_text,
                 sources=[],  # Will be added separately
                 confidence=parsed_response['confidence'],
                 reasoning=parsed_response.get('reasoning', '')
@@ -367,7 +407,7 @@ class ScientificPaperAgent:
             
         except Exception as e:
             self.logger.error(f"Error generating LLM response: {e}")
-            return self._generate_fallback_response(query, search_results)
+            return self._build_extractive_answer(query, search_results)
 
     def _extract_query_concepts(self, query: str) -> List[str]:
         """Extract key concepts from the user query"""
@@ -504,34 +544,30 @@ CONTENT:
             'reasoning': reasoning
         }
 
-    def _generate_fallback_response(self, query: str, search_results: List[SearchResult]) -> AgentResponse:
-        """Generate a fallback response when LLM is not available"""
-        if not search_results:
-            return AgentResponse(
-                answer="No relevant information found.",
-                sources=[],
-                confidence=0.0
+    def _build_extractive_answer(self, query: str, search_results: List[SearchResult]) -> AgentResponse:
+        """Produce a strict, citation-only answer directly from search results to avoid hallucinations."""
+        top = search_results[: min(5, len(search_results))]
+        parts = []
+        for r in top:
+            md = r.chunk.metadata
+            title = md.get('title', 'Unknown Document')
+            authors = md.get('enhanced_authors') or md.get('authors') or []
+            if isinstance(authors, str):
+                authors = [authors]
+            section = r.chunk.section or md.get('section', 'Unknown')
+            page = r.chunk.page_number or md.get('page_number', 'Unknown')
+            quote = None
+            if r.highlights:
+                quote = r.highlights[0]
+            else:
+                # take first 200 chars of the chunk as a quote
+                txt = r.chunk.content.strip()
+                quote = (txt[:200] + '...') if len(txt) > 200 else txt
+            parts.append(
+                f"- {title} by {', '.join(authors) if authors else 'Unknown'}\n  Section: {section} | Page: {page} | Relevance: {r.relevance_score:.2f}\n  Quote: \"{quote}\""
             )
-        
-        # Simple extractive approach
-        top_results = search_results[:3]
-        answer_parts = []
-        
-        for result in top_results:
-            chunk = result.chunk
-            title = chunk.metadata.get('title', 'Unknown Document')
-            section = chunk.section or 'unknown section'
-            
-            answer_parts.append(f"From '{title}' ({section}): {chunk.content[:200]}...")
-        
-        answer = "\n\n".join(answer_parts)
-        
-        return AgentResponse(
-            answer=answer,
-            sources=[],
-            confidence=0.6,
-            reasoning="Fallback extractive response due to LLM unavailability"
-        )
+        answer = "Relevant sources based on your query:\n\n" + "\n\n".join(parts) if parts else "No clearly relevant passages found."
+        return AgentResponse(answer=answer, sources=[], confidence=0.75, reasoning="Extractive mode to ensure accuracy")
 
     def _format_sources(self, search_results: List[SearchResult]) -> List[Dict[str, Any]]:
         """Format search results as source citations"""
@@ -557,38 +593,26 @@ CONTENT:
         return sources
 
     def _get_general_analysis_template(self) -> str:
-        """Template for general analysis queries"""
-        return """You are a scientific research assistant. Your job is to read the provided sources and answer the user's question based ONLY on what you find in those sources.
+        """Template for general analysis queries with strict citation rules"""
+        return """You are a scientific research assistant. Answer ONLY using the provided sources.
 
-IMPORTANT INSTRUCTIONS:
-1. READ EACH SOURCE CAREFULLY - Look at the document title, authors, section, and content
-2. ONLY use information that is actually present in the sources
-3. CITE SPECIFIC PAPERS - Use the actual document titles and authors provided
-4. DO NOT make up or hallucinate information
-5. If you cannot find relevant information, say so clearly
+STRICT RULES:
+- DO NOT invent titles or authors. Only cite from SOURCE TITLES list and SOURCE blocks.
+- If nothing in the sources addresses the user question, say so clearly.
+- Prefer direct quotes with the exact section and page.
 
 User Question: {query}
 
-Here are {num_sources} sources I found in your document collection:
-
+Here are {num_sources} sources:
 {context}
 
-TASK: Answer the user's question using ONLY the information from these sources. For each relevant piece of information, cite the specific document title and section.
+TASK: Answer the user's question using ONLY these sources. When citing, use the exact title from SOURCE TITLES.
 
-FORMAT YOUR ANSWER AS:
-**Papers that used [relevant topic]:**
+FORMAT:
+- Bullet list of findings, each with: Title, Authors, Section, and a direct quote.
 
-1. **[ACTUAL PAPER TITLE]** by [AUTHORS]
-   - Section: [SECTION NAME] 
-   - What they did: [SPECIFIC DESCRIPTION FROM THE CONTENT]
-   - Quote: "[RELEVANT QUOTE FROM THE SOURCE]"
-
-2. **[NEXT PAPER TITLE]** by [AUTHORS]
-   - [Same format]
-
-If no papers discuss the topic, say: "I could not find papers in your collection that specifically discuss [topic]."
-
-Remember: Use ONLY the actual paper titles, authors, and content provided in the sources above. Do not invent or assume information."""
+Confidence: [0-100]%
+Reasoning: [brief]"""
 
     def _get_author_query_template(self) -> str:
         """Template for author-specific queries"""
@@ -678,3 +702,16 @@ VERIFICATION RESULT: [SUPPORTED/CONTRADICTED/UNCLEAR/PARTIALLY SUPPORTED]
 
 Confidence: [0-100]%
 Reasoning: [Quality and directness of evidence found]"""
+
+    def _get_source_titles(self, search_results: List[SearchResult]) -> List[str]:
+        """Collect unique source titles from search results for citation guarding."""
+        titles: List[str] = []
+        seen = set()
+        for r in search_results:
+            md = r.chunk.metadata if hasattr(r, 'chunk') and hasattr(r.chunk, 'metadata') else {}
+            # Prefer AI-verified paper_title, then title, then original_title
+            t = md.get('paper_title') or md.get('title') or md.get('original_title') or ''
+            if t and t not in seen:
+                seen.add(t)
+                titles.append(t)
+        return titles

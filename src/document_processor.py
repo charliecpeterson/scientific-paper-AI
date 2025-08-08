@@ -15,6 +15,13 @@ from docx import Document as DocxDocument
 import tiktoken
 from dataclasses import dataclass
 
+# Optional: better PDF text extraction fallback
+try:
+    import fitz  # PyMuPDF
+    HAS_FITZ = True
+except Exception:
+    HAS_FITZ = False
+
 @dataclass
 class DocumentChunk:
     """Represents a chunk of document content with metadata"""
@@ -112,9 +119,10 @@ class DocumentProcessor:
             raise ValueError(f"Unsupported file format: {file_path.suffix}")
 
     def _extract_from_pdf(self, file_path: Path, metadata: Dict) -> Tuple[str, Dict]:
-        """Extract text from PDF with page tracking"""
+        """Extract text from PDF with page tracking; fallback to PyMuPDF if needed"""
         text = ""
         page_texts = []
+        extracted_pages = 0
         
         try:
             with open(file_path, 'rb') as file:
@@ -122,7 +130,12 @@ class DocumentProcessor:
                 metadata['total_pages'] = len(reader.pages)
                 
                 for page_num, page in enumerate(reader.pages, 1):
-                    page_text = page.extract_text()
+                    try:
+                        page_text = page.extract_text() or ""
+                    except Exception:
+                        page_text = ""
+                    if page_text.strip():
+                        extracted_pages += 1
                     text += f"\n[PAGE {page_num}]\n{page_text}\n"
                     page_texts.append({
                         'page_number': page_num,
@@ -142,10 +155,20 @@ class DocumentProcessor:
                         'creator': reader.metadata.get('/Creator', ''),
                         'creation_date': reader.metadata.get('/CreationDate', '')
                     })
-                    
         except Exception as e:
-            self.logger.error(f"Error extracting PDF {file_path}: {str(e)}")
-            
+            self.logger.error(f"Error extracting PDF {file_path} with PyPDF2: {str(e)}")
+        
+        # Fallback to PyMuPDF if PyPDF2 yielded little text
+        try:
+            if HAS_FITZ:
+                total_pages = metadata.get('total_pages', 0) or 0
+                # If less than 30% of pages yielded text, try fitz
+                if total_pages > 0 and extracted_pages / total_pages < 0.3:
+                    self.logger.info("PyPDF2 yielded little text; trying PyMuPDF fallback...")
+                    return self._extract_from_pdf_with_pymupdf(file_path, metadata)
+        except Exception as e:
+            self.logger.warning(f"PyMuPDF fallback failed: {e}")
+        
         return text, metadata
 
     def _extract_from_docx(self, file_path: Path, metadata: Dict) -> Tuple[str, Dict]:
@@ -182,6 +205,35 @@ class DocumentProcessor:
             with open(file_path, 'r', encoding='latin-1') as file:
                 text = file.read()
                 
+        return text, metadata
+
+    def _extract_from_pdf_with_pymupdf(self, file_path: Path, metadata: Dict) -> Tuple[str, Dict]:
+        """Fallback extractor using PyMuPDF for better OCR-less text extraction"""
+        if not HAS_FITZ:
+            return "", metadata
+        text = ""
+        page_texts = []
+        try:
+            doc = fitz.open(str(file_path))
+            metadata['total_pages'] = len(doc)
+            for page_num in range(len(doc)):
+                page = doc[page_num]
+                page_text = page.get_text("text") or ""
+                text += f"\n[PAGE {page_num+1}]\n{page_text}\n"
+                page_texts.append({
+                    'page_number': page_num + 1,
+                    'text': page_text,
+                    'char_start': len(text) - len(page_text) - len(f"\n[PAGE {page_num+1}]\n") - 1,
+                    'char_end': len(text) - 1
+                })
+        except Exception as e:
+            self.logger.error(f"Error extracting PDF {file_path} with PyMuPDF: {e}")
+        finally:
+            try:
+                doc.close()
+            except Exception:
+                pass
+        metadata['page_texts'] = page_texts
         return text, metadata
 
     def _detect_sections(self, text: str) -> Dict[str, List[Tuple[int, int]]]:

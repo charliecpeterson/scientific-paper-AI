@@ -124,15 +124,18 @@ class IntelligentSearch:
                         collection_data['metadatas']
                     ):
                         # Reconstruct DocumentChunk objects
+                        # Normalize metadata types (e.g., parse authors lists stored as strings)
+                        normalized_metadata = self._normalize_metadata_types(metadata or {})
+                        
                         chunk = DocumentChunk(
                             chunk_id=chunk_id,
-                            document_id=metadata.get('document_id', 'unknown'),
+                            document_id=normalized_metadata.get('document_id', 'unknown'),
                             content=content,
-                            chunk_index=int(metadata.get('chunk_index', 0)),
-                            token_count=int(metadata.get('token_count', 0)),
-                            section=metadata.get('section'),
-                            page_number=int(metadata.get('page_number', 0)) if metadata.get('page_number', '0').isdigit() else None,
-                            metadata=metadata
+                            chunk_index=int(normalized_metadata.get('chunk_index', 0)),
+                            token_count=int(normalized_metadata.get('token_count', 0)),
+                            section=normalized_metadata.get('section'),
+                            page_number=int(normalized_metadata.get('page_number', 0)) if str(normalized_metadata.get('page_number', '0')).isdigit() else None,
+                            metadata=normalized_metadata
                         )
                         self.documents.append(chunk)
                     
@@ -308,7 +311,11 @@ class IntelligentSearch:
         """Detect the type of query (author, topic, etc.)"""
         query_lower = query.lower()
         
-        # Check for author queries
+        # Check for explicit author query phrasing, including "papers ... from/by/of"
+        if re.search(r'\b(?:papers?|work|research|studies?)\b.*\b(?:by|from|of)\b', query_lower):
+            return "author"
+        
+        # Check for author keywords
         author_keywords = ['author', 'wrote', 'published', 'by', 'papers by', 'work by']
         if any(keyword in query_lower for keyword in author_keywords):
             return "author"
@@ -334,23 +341,24 @@ class IntelligentSearch:
         # Search in multiple ways
         author_results = []
         
-        # 1. Search in document metadata
+        # 1. Search in document metadata (enhanced and basic authors)
         for i, doc in enumerate(self.documents):
-            authors = doc.metadata.get('authors', [])
+            authors_val = doc.metadata.get('enhanced_authors') or doc.metadata.get('authors', [])
+            authors = self._normalize_authors(authors_val)
             if self._author_matches(author_name, authors):
                 relevance = self._calculate_author_relevance(author_name, authors)
                 
                 result = SearchResult(
                     chunk=doc,
                     similarity_score=1.0,  # Perfect match for author
-                    relevance_score=relevance,
+                    relevance_score=relevance if relevance > 0 else 0.95,
                     rank=i
                 )
                 author_results.append(result)
         
         # 2. Search in filename (common in academic papers)
         for i, doc in enumerate(self.documents):
-            filename = doc.metadata.get('filename', '')
+            filename = str(doc.metadata.get('filename', '') or '')
             if self._author_in_filename(author_name, filename):
                 relevance = 0.9  # High relevance for filename match
                 
@@ -364,7 +372,7 @@ class IntelligentSearch:
         
         # 3. Search in document title
         for i, doc in enumerate(self.documents):
-            title = doc.metadata.get('title', '')
+            title = str(doc.metadata.get('title', '') or '')
             if self._author_in_text(author_name, title):
                 relevance = 0.8  # Good relevance for title match
                 
@@ -378,7 +386,385 @@ class IntelligentSearch:
         
         # 4. Search in content for author citations/mentions
         if not author_results:
-            # If no metadata matches, search content
+            content_results = self._search_author_in_content(author_name, max_results)
+            author_results.extend(content_results)
+        
+        # Remove duplicates and sort by relevance
+        seen_chunks = set()
+        unique_results = []
+        for result in author_results:
+            chunk_id = id(result.chunk)
+            if chunk_id not in seen_chunks:
+                seen_chunks.add(chunk_id)
+                unique_results.append(result)
+        
+        unique_results.sort(key=lambda x: x.relevance_score, reverse=True)
+        
+        self.logger.info(f"Found {len(unique_results)} results for author '{author_name}'")
+        return unique_results[:max_results]
+
+    def _author_in_filename(self, author_name: str, filename: str) -> bool:
+        """Check if author name appears in filename"""
+        if not filename or not author_name:
+            return False
+        
+        filename_lower = filename.lower()
+        author_parts = author_name.lower().split()
+        
+        # Check if all author parts appear in filename
+        return all(part in filename_lower for part in author_parts if len(part) > 2)
+
+    def _author_in_text(self, author_name: str, text: str) -> bool:
+        """Check if author name appears in text"""
+        if not text or not author_name:
+            return False
+        
+        text_lower = text.lower()
+        author_parts = author_name.lower().split()
+        
+        # Check for various author mention patterns
+        full_name = ' '.join(author_parts)
+        if full_name in text_lower:
+            return True
+        
+        # Check for last name only
+        if len(author_parts) > 1 and author_parts[-1] in text_lower:
+            return True
+        
+        return False
+
+    def _search_author_in_content(self, author_name: str, max_results: int) -> List[SearchResult]:
+        """Search for author mentions in document content"""
+        results = []
+        author_parts = author_name.lower().split()
+        
+        for i, doc in enumerate(self.documents):
+            content_lower = doc.content.lower()
+            
+            # Look for author name patterns in content
+            score = 0
+            if ' '.join(author_parts) in content_lower:
+                score = 0.7  # Full name match
+            elif len(author_parts) > 1 and author_parts[-1] in content_lower:
+                score = 0.5  # Last name match
+            
+            if score > 0:
+                result = SearchResult(
+                    chunk=doc,
+                    similarity_score=score,
+                    relevance_score=score,
+                    rank=i
+                )
+                results.append(result)
+        
+        return results
+
+    def _normalize_metadata_types(self, metadata: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize metadata fields loaded from persistent storage.
+        Fix list-like fields stored as strings (authors, enhanced_authors, key_topics) and cast simple types.
+        """
+        import ast
+        norm = dict(metadata) if metadata else {}
+        
+        def parse_list(val):
+            if isinstance(val, list):
+                return [str(x).strip() for x in val if str(x).strip()]
+            if isinstance(val, str):
+                s = val.strip()
+                # Try to parse Python-list-like strings
+                if (s.startswith('[') and s.endswith(']')) or (s.startswith('(') and s.endswith(')')):
+                    try:
+                        parsed = ast.literal_eval(s)
+                        if isinstance(parsed, (list, tuple)):
+                            return [str(x).strip() for x in parsed if str(x).strip()]
+                    except Exception:
+                        pass
+                # Fallback: split on semicolons or commas if looks like delimited names
+                if any(sep in s for sep in [';', ',']) and len(s) > 20:
+                    parts = re.split(r'[;,]', s)
+                    return [p.strip() for p in parts if p.strip()]
+                return [s]
+            return []
+        
+        # Normalize author-related fields
+        if 'authors' in norm:
+            norm['authors'] = parse_list(norm.get('authors'))
+        if 'enhanced_authors' in norm:
+            norm['enhanced_authors'] = parse_list(norm.get('enhanced_authors'))
+        if 'key_topics' in norm:
+            norm['key_topics'] = parse_list(norm.get('key_topics'))
+        
+        # Cast confidences/years when possible
+        for k in ['title_confidence']:
+            if k in norm:
+                try:
+                    norm[k] = float(norm[k])
+                except Exception:
+                    pass
+        for k in ['year', 'publication_year']:
+            if k in norm and norm[k] not in (None, ''):
+                try:
+                    norm[k] = int(float(norm[k]))
+                except Exception:
+                    pass
+        return norm
+
+    def _normalize_authors(self, authors_val: Any) -> List[str]:
+        """Normalize various author metadata representations into a list of names."""
+        import ast
+        if not authors_val:
+            return []
+        if isinstance(authors_val, list):
+            return [str(a).strip() for a in authors_val if str(a).strip()]
+        if isinstance(authors_val, str):
+            s = authors_val.strip()
+            if (s.startswith('[') and s.endswith(']')) or (s.startswith('(') and s.endswith(')')):
+                try:
+                    parsed = ast.literal_eval(s)
+                    if isinstance(parsed, (list, tuple)):
+                        return [str(a).strip() for a in parsed if str(a).strip()]
+                except Exception:
+                    pass
+            return [s]
+        return []
+
+    def add_documents(self, chunks: List[DocumentChunk]):
+        """Add document chunks to the search index"""
+        if not chunks:
+            return
+        
+        # Check for duplicates to avoid re-processing
+        existing_ids = set()
+        try:
+            # Get existing document IDs
+            existing_data = self.collection.get()
+            existing_ids = set(existing_data['ids'])
+        except:
+            pass
+        
+        # Filter out already processed chunks
+        new_chunks = [chunk for chunk in chunks if chunk.chunk_id not in existing_ids]
+        
+        if not new_chunks:
+            self.logger.info("All documents already processed, skipping...")
+            # Still need to update local documents list for TF-IDF
+            self.documents.extend(chunks)
+            self._update_tfidf_index()
+            return
+        
+        self.logger.info(f"Adding {len(new_chunks)} new chunks (out of {len(chunks)} total)")
+        self.documents.extend(new_chunks)
+        
+        # Prepare data for ChromaDB
+        texts = [chunk.content for chunk in new_chunks]
+        ids = [chunk.chunk_id for chunk in new_chunks]
+        metadatas = []
+        
+        for chunk in new_chunks:
+            metadata = chunk.metadata.copy()
+            metadata.update({
+                'document_id': chunk.document_id,
+                'section': chunk.section or 'unknown',
+                'page_number': chunk.page_number or 0,
+                'chunk_index': chunk.chunk_index,
+                'token_count': chunk.token_count
+            })
+            # Convert all values to strings for ChromaDB
+            metadata = {k: str(v) for k, v in metadata.items() if v is not None}
+            metadatas.append(metadata)
+        
+        # Generate embeddings
+        try:
+            if hasattr(self.embedding_model, 'embed_documents'):
+                # Ollama embeddings
+                embeddings = self.embedding_model.embed_documents(texts)
+            else:
+                # Sentence transformers
+                embeddings = self.embedding_model.encode(texts).tolist()
+            
+            # Add to ChromaDB
+            self.collection.add(
+                documents=texts,
+                embeddings=embeddings,
+                metadatas=metadatas,
+                ids=ids
+            )
+            
+            self.logger.info(f"Added {len(chunks)} chunks to search index")
+            
+        except Exception as e:
+            self.logger.error(f"Error adding documents to index: {e}")
+        
+        # Update TF-IDF matrix
+        self._update_tfidf_index()
+
+    def clear_all_documents(self):
+        """Completely clear all documents from the collection and reset the search engine"""
+        try:
+            # Delete the entire collection
+            self.chroma_client.delete_collection(self.collection_name)
+            self.logger.info("Deleted ChromaDB collection")
+            
+            # Recreate the collection
+            self.collection = self.chroma_client.create_collection(
+                name=self.collection_name,
+                metadata={"hnsw:space": "cosine"}
+            )
+            self.logger.info("Recreated empty ChromaDB collection")
+            
+            # Clear local data structures
+            self.documents = []
+            self.tfidf_matrix = None
+            self.tfidf_vectorizer = None
+            
+            self.logger.info("Cleared all documents and reset search engine")
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error clearing documents: {e}")
+            # Fallback: try to delete all items from existing collection
+            try:
+                all_data = self.collection.get()
+                if all_data.get('ids'):
+                    self.collection.delete(ids=all_data['ids'])
+                    self.documents = []
+                    self.logger.info("Fallback: Cleared all items from collection")
+                    return True
+            except Exception as fallback_error:
+                self.logger.error(f"Fallback deletion also failed: {fallback_error}")
+                return False
+
+    def _update_tfidf_index(self):
+        """Update TF-IDF index for keyword-based search"""
+        try:
+            # Ensure we have documents to work with
+            if not hasattr(self, 'documents'):
+                self.documents = []
+            
+            # If we have local documents, use them
+            if self.documents:
+                texts = [doc.content for doc in self.documents]
+                self.logger.info(f"Building TF-IDF index from {len(texts)} local documents")
+            else:
+                # Try to rebuild from persistent database
+                self.logger.info("Rebuilding TF-IDF index from persistent database...")
+                collection_data = self.collection.get(include=['documents'])
+                if collection_data and collection_data['documents']:
+                    texts = collection_data['documents']
+                    self.logger.info(f"Building TF-IDF index from {len(texts)} stored documents")
+                else:
+                    self.logger.warning("No documents available for TF-IDF indexing")
+                    return
+            
+            if texts:
+                self.tfidf_matrix = self.tfidf_vectorizer.fit_transform(texts)
+                self.logger.info(f"Successfully updated TF-IDF index with {len(texts)} documents")
+            else:
+                self.logger.warning("No text content available for TF-IDF indexing")
+                
+        except Exception as e:
+            self.logger.error(f"Error updating TF-IDF index: {e}")
+
+    def search(self, query: str, max_results: int = None, relaxed: bool = False) -> List[SearchResult]:
+        """Intelligent hierarchical search with adaptive parameters"""
+        
+        # Intelligent defaults based on collection size and query
+        if max_results is None:
+            collection_size = len(self.documents)
+            if collection_size < 10:
+                max_results = min(50, collection_size * 5)  # Much more comprehensive for small collections
+            elif collection_size < 100:
+                max_results = 75  # Significantly increased
+            else:
+                max_results = 100  # No artificial limits for large collections
+        
+        # Detect query type
+        query_type = self._detect_query_type(query)
+        
+        if query_type == "author":
+            return self._search_by_author(query, max_results)
+        else:
+            return self._search_by_content(query, max_results, relaxed)
+
+    def _detect_query_type(self, query: str) -> str:
+        """Detect the type of query (author, topic, etc.)"""
+        query_lower = query.lower()
+        
+        # Check for explicit author query phrasing, including "papers ... from/by/of"
+        if re.search(r'\b(?:papers?|work|research|studies?)\b.*\b(?:by|from|of)\b', query_lower):
+            return "author"
+        
+        # Check for author keywords
+        author_keywords = ['author', 'wrote', 'published', 'by', 'papers by', 'work by']
+        if any(keyword in query_lower for keyword in author_keywords):
+            return "author"
+        
+        # Check for patterns
+        for pattern in self.author_query_patterns:
+            if re.search(pattern, query, re.IGNORECASE):
+                return "author"
+        
+        return "content"
+
+    def _search_by_author(self, query: str, max_results: int) -> List[SearchResult]:
+        """Enhanced search for papers by specific authors"""
+        # Extract author name from query
+        author_name = self._extract_author_from_query(query)
+        
+        if not author_name:
+            # Fallback to content search if no author detected
+            return self._search_by_content(query, max_results)
+        
+        self.logger.info(f"Searching for author: '{author_name}'")
+        
+        # Search in multiple ways
+        author_results = []
+        
+        # 1. Search in document metadata (enhanced and basic authors)
+        for i, doc in enumerate(self.documents):
+            authors_val = doc.metadata.get('enhanced_authors') or doc.metadata.get('authors', [])
+            authors = self._normalize_authors(authors_val)
+            if self._author_matches(author_name, authors):
+                relevance = self._calculate_author_relevance(author_name, authors)
+                
+                result = SearchResult(
+                    chunk=doc,
+                    similarity_score=1.0,  # Perfect match for author
+                    relevance_score=relevance if relevance > 0 else 0.95,
+                    rank=i
+                )
+                author_results.append(result)
+        
+        # 2. Search in filename (common in academic papers)
+        for i, doc in enumerate(self.documents):
+            filename = str(doc.metadata.get('filename', '') or '')
+            if self._author_in_filename(author_name, filename):
+                relevance = 0.9  # High relevance for filename match
+                
+                result = SearchResult(
+                    chunk=doc,
+                    similarity_score=0.95,
+                    relevance_score=relevance,
+                    rank=i
+                )
+                author_results.append(result)
+        
+        # 3. Search in document title
+        for i, doc in enumerate(self.documents):
+            title = str(doc.metadata.get('title', '') or '')
+            if self._author_in_text(author_name, title):
+                relevance = 0.8  # Good relevance for title match
+                
+                result = SearchResult(
+                    chunk=doc,
+                    similarity_score=0.9,
+                    relevance_score=relevance,
+                    rank=i
+                )
+                author_results.append(result)
+        
+        # 4. Search in content for author citations/mentions
+        if not author_results:
             content_results = self._search_author_in_content(author_name, max_results)
             author_results.extend(content_results)
         
@@ -458,12 +844,12 @@ class IntelligentSearch:
         
         # Enhanced patterns to handle various phrasings and typos
         enhanced_patterns = [
-            r'papers?\s+(?:where|were|written|authored|published)?\s*by\s+([a-zA-Z\s]+?)(?:\s|$|,|\?|\.)',
-            r'(?:work|research|papers?)\s+(?:of|from|by)\s+([a-zA-Z\s]+?)(?:\s|$|,|\?|\.)',
-            r'author[s]?\s+([a-zA-Z\s]+?)(?:\s|$|,|\?|\.)',
-            r'([a-zA-Z\s]+?)\s+(?:papers?|work|research|publications?)',
-            r'written\s+by\s+([a-zA-Z\s]+?)(?:\s|$|,|\?|\.)',
-            r'published\s+by\s+([a-zA-Z\s]+?)(?:\s|$|,|\?|\.)'
+            r'papers?\s+(?:were|where)?\s*(?:from|by|of)\s+([a-zA-Z\s\.-]+?)(?:\s|$|,|\?|\.)',
+            r'(?:work|research|papers?)\s+(?:of|from|by)\s+([a-zA-Z\s\.-]+?)(?:\s|$|,|\?|\.)',
+            r'author[s]?\s+([a-zA-Z\s\.-]+?)(?:\s|$|,|\?|\.)',
+            r'([a-zA-Z\s\.-]+?)\s+(?:papers?|work|research|publications?)',
+            r'written\s+by\s+([a-zA-Z\s\.-]+?)(?:\s|$|,|\?|\.)',
+            r'published\s+by\s+([a-zA-Z\s\.-]+?)(?:\s|$|,|\?|\.)'
         ]
         
         for pattern in enhanced_patterns:
